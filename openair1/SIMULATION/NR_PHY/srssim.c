@@ -2,16 +2,15 @@
  * SPDX-License-Identifier: LicenseRef-CSSL-1.0
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "common/utils/nr/nr_common.h"
-#include "common/utils/var_array.h"
 #define inMicroS(a) (((double)(a)) / (get_cpu_freq_GHz() * 1000.0))
 #include "SIMULATION/LTE_PHY/common_sim.h"
 #include "common/utils/assertions.h"
 #include "PHY/INIT/nr_phy_init.h"
 #include "PHY/MODULATION/nr_modulation.h"
-#include "PHY/MODULATION/modulation_common.h"
 #include "PHY/NR_REFSIG/ul_ref_seq_nr.h"
 #include "PHY/NR_TRANSPORT/nr_transport_common_proto.h"
 #include "PHY/NR_TRANSPORT/nr_transport_proto.h"
@@ -40,7 +39,7 @@ THREAD_STRUCT thread_struct;
 
 // needed for some functions
 uint16_t n_rnti = 0x1234;
-openair0_config_t openair0_cfg[MAX_CARDS];
+openair0_config_t openair0_cfg_g[MAX_CARDS] = {};
 nrUE_params_t nrUE_params;
 
 nrUE_params_t *get_nrUE_params(void)
@@ -58,6 +57,10 @@ void e1_bearer_context_setup(const e1ap_bearer_setup_req_t *req)
   abort();
 }
 void e1_bearer_context_modif(const e1ap_bearer_mod_req_t *req)
+{
+  abort();
+}
+void e1_bearer_context_mod_confirm(const e1ap_bearer_mod_confirm_t *conf)
 {
   abort();
 }
@@ -316,7 +319,7 @@ int main(int argc, char *argv[])
   gNB = calloc_or_fail(1, sizeof(PHY_VARS_gNB));
   gNB->ofdm_offset_divisor = UINT_MAX;
   gNB->RU_list[0] = calloc_or_fail(1, sizeof(**gNB->RU_list));
-  gNB->RU_list[0]->rfdevice.openair0_cfg = openair0_cfg;
+  gNB->RU_list[0]->rfdevice.openair0_cfg = openair0_cfg_g;
 
   NR_DL_FRAME_PARMS *fp = &gNB->frame_parms;
   fp->N_RB_DL = N_RB_DL;
@@ -513,8 +516,9 @@ int main(int argc, char *argv[])
   // Compute transmitter energy level
   double txlev_sum = compute_tx_energy_level(txdata, n_tx, symbol_offset, symbol_length, n_trials);
 
+  init_sorted_list_meas(&gNB->rx_srs_stats, n_trials);
+
   for (SNR = snr0; SNR <= snr1 && !stop; SNR += snr_step) {
-    varArray_t *table_rx = initVarArray(1000, sizeof(double));
     reset_meas(&gNB->rx_srs_stats);
     reset_meas(&gNB->generate_srs_stats);
     reset_meas(&gNB->get_srs_signal_stats);
@@ -522,6 +526,7 @@ int main(int argc, char *argv[])
     reset_meas(&gNB->srs_timing_advance_stats);
 
     double sum_srs_snr = 0;
+    int valid_srs_estimates = 0;
     int tao_ns_count = 0;
     for (trial = 0; trial < n_trials && !stop; trial++) {
       // Estimate noise power from the transmitter level and SNR
@@ -573,6 +578,12 @@ int main(int argc, char *argv[])
                            &timing_advance_offset,
                            timing_advance_offset_nsec);
 
+      if (srs_est < 0) {
+        stop_meas(&gNB->rx_srs_stats);
+        continue;
+      }
+
+      valid_srs_estimates++;
       sum_srs_snr += pow(10, (double)snr / 10.0);
 
       int16_t delay_ns = delay * 1e9 / (fp->samples_per_frame * 100);
@@ -588,12 +599,20 @@ int main(int argc, char *argv[])
       stop_meas(&gNB->rx_srs_stats);
     } // trail loop
     float tao_ns_rate = (float)tao_ns_count / (n_trials * n_rx);
-    float SRS_SNR_dB = 10 * log10(sum_srs_snr / n_trials);
-    printf("Actual SNR : %f, Estimated SNR from SRS %f (dB), TA offset success rate %f %%\n", SNR, SRS_SNR_dB, tao_ns_rate * 100);
+    float SRS_SNR_dB = NAN;
+    if (valid_srs_estimates > 0) {
+      SRS_SNR_dB = 10 * log10(sum_srs_snr / valid_srs_estimates);
+      printf("Actual SNR : %f, Estimated SNR from SRS %f (dB), TA offset success rate %f %%\n", SNR, SRS_SNR_dB, tao_ns_rate * 100);
+    } else {
+      printf("Actual SNR : %f, Estimated SNR from SRS unavailable (no valid estimates), TA offset success rate %f %%\n",
+             SNR,
+             tao_ns_rate * 100);
+    }
+    printf("Valid SRS estimates: %d/%d\n", valid_srs_estimates, trial);
 
     if (print_perf == 1) {
       printf("\ngNB RX\n");
-      printDistribution(&gNB->rx_srs_stats, table_rx, "RX SRS time");
+      printDistribution(&gNB->rx_srs_stats, "RX SRS time");
       printStatIndent(&gNB->generate_srs_stats, "Generate SRS sequence time");
       printStatIndent(&gNB->get_srs_signal_stats, "Get SRS signal time");
       printStatIndent(&gNB->srs_channel_estimation_stats, "SRS channel estimation time");
@@ -601,15 +620,15 @@ int main(int argc, char *argv[])
       printf("\n");
     }
 
-    free(table_rx);
-
     int srs_ret = 1;
-    if (SNR > 30 && SRS_SNR_dB > 30) {
-      srs_ret = 0;
-    } else if (SNR >= SRS_SNR_dB) {
-      srs_ret = SRS_SNR_dB >= 0.7 * SNR ? 0 : 1;
-    } else if (SRS_SNR_dB > SNR) {
-      srs_ret = SNR >= 0.7 * SRS_SNR_dB ? 0 : 1;
+    if (valid_srs_estimates > 0) {
+      if (SNR > 30 && SRS_SNR_dB > 30) {
+        srs_ret = 0;
+      } else if (SNR >= SRS_SNR_dB) {
+        srs_ret = SRS_SNR_dB >= 0.7 * SNR ? 0 : 1;
+      } else if (SRS_SNR_dB > SNR) {
+        srs_ret = SNR >= 0.7 * SRS_SNR_dB ? 0 : 1;
+      }
     }
 
     if (tao_ns_rate > 0.9 && srs_ret == 0) {
@@ -625,6 +644,7 @@ int main(int argc, char *argv[])
 
   // free memory
 
+  free_sorted_list_meas(&gNB->rx_srs_stats);
   for (i = 0; i < n_tx; i++) {
     free(s_re[i]);
     free(s_im[i]);

@@ -59,6 +59,86 @@ static const uint16_t table_7_3_1_1_2_32[3][15] = {
     {0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 };
 
+#define MAX_FRONTLOAD_SYMB 2
+#define MAX_CDM_GROUPS 3
+#define MAX_TYPE1_DMRS_MASK 256
+#define MAX_TYPE2_DMRS_MASK 4096
+
+int get_dci_antenna_ports_val(uint8_t rank, uint16_t dmrs_ports, uint8_t cdm, int dmrs_type, uint8_t front_load, int tp);
+int decode_dci_antenna_ports_val(uint8_t rank,
+                                 const long *dmrs_type,
+                                 long tp,
+                                 uint8_t val,
+                                 uint8_t *cdm,
+                                 uint16_t *dmrs_ports,
+                                 int *front_load);
+
+typedef struct {
+  uint8_t cdm_groups;
+  uint16_t port_mask;
+  uint8_t num_front_load_symb;
+} dci_port_rev_t;
+
+// Type 1 UE reverse tables
+static const dci_port_rev_t lut_rev_t1_r1[] = {{1, 1, 1},
+                                               {1, 2, 1},
+                                               {2, 1, 1},
+                                               {2, 2, 1},
+                                               {2, 4, 1},
+                                               {2, 8, 1},
+                                               {2, 1, 2},
+                                               {2, 2, 2},
+                                               {2, 4, 2},
+                                               {2, 8, 2},
+                                               {2, 16, 2},
+                                               {2, 32, 2},
+                                               {2, 64, 2},
+                                               {2, 128, 2}};
+static const dci_port_rev_t lut_rev_t1_r2[] =
+    {{1, 3, 1}, {2, 3, 1}, {2, 12, 1}, {2, 5, 1}, {2, 3, 2}, {2, 12, 2}, {2, 48, 2}, {2, 192, 2}, {2, 17, 2}, {2, 68, 2}};
+static const dci_port_rev_t lut_rev_t1_r3[] = {{2, 7, 1}, {2, 19, 2}, {2, 76, 2}};
+static const dci_port_rev_t lut_rev_t1_r4[] = {{2, 15, 1}, {2, 51, 2}, {2, 204, 2}, {2, 85, 2}};
+
+// Type 2 UE reverse tables
+static const dci_port_rev_t lut_rev_t2_r1[] = {
+    {1, 1, 1},   {1, 2, 1},   {2, 1, 1},    {2, 2, 1},    {2, 4, 1}, {2, 8, 1}, {3, 1, 1},  {3, 2, 1},  {3, 4, 1},  {3, 8, 1},
+    {3, 16, 1},  {3, 32, 1},  {3, 1, 2},    {3, 2, 2},    {3, 4, 2}, {3, 8, 2}, {3, 16, 2}, {3, 32, 2}, {3, 64, 2}, {3, 128, 2},
+    {3, 256, 2}, {3, 512, 2}, {3, 1024, 2}, {3, 2048, 2}, {1, 1, 2}, {1, 2, 2}, {1, 64, 2}, {1, 128, 2}};
+static const dci_port_rev_t lut_rev_t2_r2[] = {{1, 3, 1},
+                                               {2, 3, 1},
+                                               {2, 12, 1},
+                                               {3, 3, 1},
+                                               {3, 12, 1},
+                                               {3, 48, 1},
+                                               {2, 5, 1},
+                                               {3, 3, 2},
+                                               {3, 12, 2},
+                                               {3, 48, 2},
+                                               {3, 192, 2},
+                                               {3, 768, 2},
+                                               {3, 3072, 2},
+                                               {1, 3, 2},
+                                               {1, 192, 2},
+                                               {2, 3, 2},
+                                               {2, 12, 2},
+                                               {2, 192, 2},
+                                               {2, 768, 2}};
+static const dci_port_rev_t lut_rev_t2_r3[] = {{2, 7, 1}, {3, 7, 1}, {3, 56, 1}, {3, 67, 2}, {3, 268, 2}, {3, 1072, 2}};
+static const dci_port_rev_t lut_rev_t2_r4[] = {{2, 15, 1}, {3, 15, 1}, {3, 195, 2}, {3, 780, 2}, {3, 3120, 2}};
+
+static const dci_port_rev_t lut_tp_rev[] = {{2, 1, 1},
+                                            {2, 2, 1},
+                                            {2, 4, 1},
+                                            {2, 8, 1},
+                                            {2, 1, 2},
+                                            {2, 2, 2},
+                                            {2, 4, 2},
+                                            {2, 8, 2},
+                                            {2, 16, 2},
+                                            {2, 32, 2},
+                                            {2, 64, 2},
+                                            {2, 128, 2}};
+
 typedef enum {
   pusch_dmrs_pos0 = 0,
   pusch_dmrs_pos1 = 1,
@@ -75,6 +155,11 @@ typedef struct {
   uint16_t bwpStart;
   uint16_t bwpSize;
 } bwp_info_t;
+
+typedef struct {
+  float ssb_per_ro;
+  int preambles_per_ssb;
+} ssb_ro_preambles_t;
 
 uint32_t get_Y(const NR_SearchSpace_t *ss, int slot, rnti_t rnti);
 
@@ -93,6 +178,7 @@ uint16_t get_ul_bitmap(const frame_structure_t *fs, int slot);
 bool is_ul_slot(const slot_t slot, const frame_structure_t *fs);
 bool is_dl_slot(const slot_t slot, const frame_structure_t *fs);
 bool is_mixed_slot(const slot_t slot, const frame_structure_t *fs);
+bool is_ul_or_mixed_slot(const slot_t slot, const frame_structure_t *fs);
 int get_tdd_period_idx(NR_TDD_UL_DL_ConfigCommon_t *tdd);
 void config_frame_structure(int mu,
                             const NR_TDD_UL_DL_ConfigCommon_t *tdd_UL_DL_ConfigurationCommon,
@@ -169,6 +255,7 @@ uint8_t compute_nr_root_seq(NR_RACH_ConfigCommon_t *rach_config,
                             uint8_t nb_preambles,
                             uint8_t unpaired,
                             frequency_range_t);
+ssb_ro_preambles_t get_ssb_ro_preambles_4step(struct NR_RACH_ConfigCommon__ssb_perRACH_OccasionAndCB_PreamblesPerSSB *config);
 
 int ul_ant_bits(NR_DMRS_UplinkConfig_t *NR_DMRS_UplinkConfig, long transformPrecoder);
 
@@ -242,8 +329,7 @@ uint8_t get_pusch_nb_antenna_ports(NR_PUSCH_Config_t *pusch_Config,
                                    NR_SRS_Config_t *srs_config,
                                    dci_field_t srs_resource_indicator);
 
-uint16_t compute_pucch_prb_size(uint8_t format,
-                                uint8_t nr_prbs,
+uint16_t compute_pucch_prb_size(uint8_t nr_prbs,
                                 uint16_t O_csi,
                                 uint16_t O_ack,
                                 uint8_t O_sr,
@@ -328,4 +414,5 @@ bool nr_pcch_type2_po_mo_in_range(int frame, int slot, int slots_per_frame, int 
 
 uint16_t nr_pdcch_monitoring_symbols_mask(const BIT_STRING_t *symbols_in_slot, uint8_t sps);
 
+uint8_t getNRBG(uint16_t bwp_size, uint16_t bwp_start, long rbg_size_config);
 #endif

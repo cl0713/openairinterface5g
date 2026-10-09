@@ -424,6 +424,7 @@ int main(int argc, char **argv)
 
   NR_gNB_ULSCH_t *ulsch_gNB = &gNB->ulsch[UE_id];
   NR_UL_gNB_HARQ_t *harq_process_gNB = ulsch_gNB->harq_process;
+  ulsch_gNB->harq_pid = 0;
   nfapi_nr_pusch_pdu_t *rel15_ul = &harq_process_gNB->ulsch_pdu;
   NR_gNB_PUSCH *pusch_vars = &gNB->pusch_vars[UE_id];
 
@@ -496,7 +497,8 @@ int main(int argc, char **argv)
 
   if (input_fd == NULL) {
     uint8_t ULSCH_ids[] = {0};
-    nr_ulsch_pre_encoding(UE, ulsch_ue, 0, 0, &G, 1, ULSCH_ids);
+    const nfapi_nr_ue_pusch_pdu_t *p = &ulsch_ue->pusch_pdu;
+    nr_ulsch_pre_encoding(harq_process_ul_ue, p->pusch_data.tb_size, p->nrOfLayers, p->ldpcBaseGraph);
     nr_ulsch_encoding(UE, ulsch_ue, 0, 0, &G, 1, ULSCH_ids);
   }
   

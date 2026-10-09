@@ -52,10 +52,6 @@ typedef struct {
   NR_SCH_status_t status;
   /// NDAPI struct for UE
   nfapi_nr_ue_pusch_pdu_t pusch_pdu;
-  // UL number of harq processes
-  uint8_t number_harq_processes_for_pusch;
-  /// RNTI type
-  nr_rnti_type_t rnti_type;
   /// Cell ID
   int     Nid_cell;
   /// bit mask of PT-RS ofdm symbol indicies
@@ -64,14 +60,16 @@ typedef struct {
 } NR_UE_ULSCH_t;
 
 typedef struct {
-  /// Indicator of first reception
+  /// Set on new data; cleared after nr_dlsch_decoding() segments the TB. Stays set if decode never ran.
   uint8_t first_rx;
   /// DLSCH status flag indicating
   NR_SCH_status_t status;
-  /// Pointer to the payload (38.212 V15.4.0 section 5.1)
-  uint8_t *b;
   /// Pointer to transport block segments
   uint8_t *c;
+#ifdef LDPC_CUDA
+  /// Pointer to transport block segments (GPU pointer for c when using shared memory, should be the same on Jetson
+  uint8_t *cdev;
+#endif
   /// soft bits for each received segment ("d"-sequence)(for definition see 36-212 V8.6 2009-03, p.15)
   /// Accumulates the soft bits for each round to increase decoding success (HARQ)
   int16_t *d;
@@ -95,6 +93,9 @@ typedef struct {
   /// Number of segments processed so far
   uint32_t processedSegments;
   decode_abort_t abort_decode;
+  /* Slot of the grant that armed this process. A late decode only retires if it still matches. */
+  int activated_frame;
+  int activated_slot;
 } NR_DL_UE_HARQ_t;
 
 typedef struct {
@@ -109,10 +110,6 @@ typedef struct {
   uint8_t max_ldpc_iterations;
   /// number of iterations used in last turbo decoding
   int8_t last_iteration_cnt;
-  /// bit mask of PT-RS ofdm symbol indicies
-  uint16_t ptrs_symbols;
-  // PTRS symbol index, to be updated every PTRS symbol within a slot.
-  uint8_t ptrs_symbol_index;
 } NR_UE_DLSCH_t;
 
 typedef struct {

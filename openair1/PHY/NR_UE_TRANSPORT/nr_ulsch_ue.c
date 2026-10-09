@@ -5,6 +5,7 @@
 /*!
  * \brief Top-level routines for transmission of the PUSCH TS 38.211 v 15.4.0
  */
+#include "utils.h"
 #include <stdint.h>
 #include "PHY/NR_REFSIG/dmrs_nr.h"
 #include "PHY/NR_REFSIG/ptrs_nr.h"
@@ -12,7 +13,7 @@
 #include "PHY/NR_UE_TRANSPORT/nr_transport_ue.h"
 #include "PHY/NR_UE_TRANSPORT/nr_transport_proto_ue.h"
 #include "PHY/MODULATION/nr_modulation.h"
-#include "PHY/MODULATION/modulation_common.h"
+#include "PHY/MODULATION/phy_ofdm_mod.h"
 #include "common/utils/assertions.h"
 #include "common/utils/nr/nr_common.h"
 #include "PHY/NR_TRANSPORT/nr_transport_common_proto.h"
@@ -157,7 +158,7 @@ static void map_data_ptrs(const unsigned int ptrsIdx, const c16_t *data, const c
   memcpy(out, data, sizeof(c16_t) * ptrsIdx);
   data += ptrsIdx;
   *(out + ptrsIdx) = *ptrs;
-  memcpy(out + ptrsIdx + 1, data, sizeof(c16_t) * NR_NB_SC_PER_RB - ptrsIdx - 1);
+  memcpy(out + ptrsIdx + 1, data, sizeof(c16_t) * (NR_NB_SC_PER_RB - ptrsIdx - 1));
 }
 
 /*
@@ -169,73 +170,12 @@ static void map_data_rb(const c16_t *data, c16_t *out)
 }
 
 /*
-This function is used when a PRB is on both sides of DC.
-The destination buffer in this case in not contiguous so REs are mapped on to a temporary buffer
-so that we can reuse the existing functions. Then it is copied to the destination buffer.
-*/
-static void map_over_dc(const unsigned int right_dc,
-                        const unsigned int num_cdm_no_data,
-                        const unsigned int fft_size,
-                        const unsigned int dmrs_per_rb,
-                        const unsigned int data_per_rb,
-                        const unsigned int delta,
-                        const unsigned int ptrsIdx,
-                        const c16_t **ptrs,
-                        const c16_t **dmrs,
-                        const c16_t **data,
-                        c16_t **out,
-                        map_dmrs_func_t map_data_dmrs_ptr,
-                        map_dmrs_func_t map_dmrs_ptr)
-{
-  // if first RE is DC no need to map in this function
-  if (right_dc == 0)
-    return;
-
-  c16_t *out_tmp = *out;
-  c16_t tmp_out_buf[NR_NB_SC_PER_RB];
-  const unsigned int left_dc = NR_NB_SC_PER_RB - right_dc;
-  /* copy out to temp buffer. incase we want to preserve the REs in the out buffer
-     as we call mapping of data in DMRS symbol after mapping DMRS REs
-  */
-  memcpy(tmp_out_buf, out_tmp, sizeof(c16_t) * left_dc);
-  out_tmp -= (fft_size - left_dc);
-  memcpy(tmp_out_buf + left_dc, out_tmp, sizeof(c16_t) * right_dc);
-
-  /* map on to temp buffer */
-  if (dmrs && data) {
-    map_data_dmrs_ptr(num_cdm_no_data, *data, tmp_out_buf);
-    *data += data_per_rb;
-  } else if (dmrs) {
-    map_dmrs_ptr(delta, *dmrs, tmp_out_buf);
-    *dmrs += dmrs_per_rb;
-  } else if (ptrs) {
-    map_data_ptrs(ptrsIdx, *data, *ptrs, tmp_out_buf);
-    *data += (NR_NB_SC_PER_RB - 1);
-    *ptrs += 1;
-  } else if (data) {
-    map_data_rb(*data, tmp_out_buf);
-    *data += NR_NB_SC_PER_RB;
-  } else {
-    DevAssert(false);
-  }
-
-  /* copy back to out buffer */
-  out_tmp = *out;
-  memcpy(out_tmp, tmp_out_buf, sizeof(c16_t) * left_dc);
-  out_tmp -= (fft_size - left_dc);
-  memcpy(out_tmp, tmp_out_buf + left_dc, sizeof(c16_t) * right_dc);
-  out_tmp += right_dc;
-  *out = out_tmp;
-}
-
-/*
 Holds params needed for PUSCH resoruce mapping
 */
 typedef struct {
   rnti_t rnti;
   unsigned int K_ptrs;
   unsigned int k_RE_ref;
-  unsigned int first_sc_offset;
   unsigned int fft_size;
   unsigned int num_rb_max;
   unsigned int symbols_per_slot;
@@ -260,10 +200,10 @@ typedef struct {
 } nr_phy_pxsch_params_t;
 
 /*
-Map all REs in one OFDM symbol
-This function operation is as follows:
-mapping is done on RB basis. if RB contains DC and if DC is in middle
-of the RB, then the mapping is done via map_over_dc().
+Map all REs in one OFDM symbol.
+txdataF is FFT shifted, i.e. the first negative frequency of the carrier is at
+index 0 and the REs of the whole carrier are contiguous, so the allocation is
+always a contiguous range of REs.
 */
 static void map_current_symbol(const nr_phy_pxsch_params_t p,
                                const bool dmrs_symbol,
@@ -276,9 +216,7 @@ static void map_current_symbol(const nr_phy_pxsch_params_t p,
                                map_data_dmrs_func_t map_data_dmrs_ptr)
 {
   const unsigned int abs_start_rb = p.bwp_start + p.start_rb;
-  const unsigned int start_sc = (p.first_sc_offset + abs_start_rb * NR_NB_SC_PER_RB) % p.fft_size;
-  const unsigned int dc_rb = (p.fft_size - start_sc) / NR_NB_SC_PER_RB;
-  const unsigned int rb_over_dc = (p.fft_size - start_sc) % NR_NB_SC_PER_RB;
+  const unsigned int start_sc = abs_start_rb * NR_NB_SC_PER_RB;
   const unsigned int n_cdm = p.num_cdm_no_data;
   const c16_t *data_tmp = *data;
   /* If current symbol is DMRS symbol */
@@ -289,17 +227,6 @@ static void map_current_symbol(const nr_phy_pxsch_params_t p,
     const c16_t *p_mod_dmrs = dmrs_seq + abs_start_rb * dmrs_per_rb;
     c16_t *out_tmp = out + start_sc;
     for (unsigned int rb = 0; rb < p.nb_rb; rb++) {
-      if (rb == dc_rb) {
-        // map RB at DC
-        if (rb_over_dc) {
-          // if DC is in middle of RB, the following function handles it.
-          map_over_dc(rb_over_dc, n_cdm, p.fft_size, dmrs_per_rb, data_per_rb, p.delta, 0, NULL, &p_mod_dmrs, NULL, &out_tmp, map_data_dmrs_ptr, map_dmrs_ptr);
-          continue;
-        } else {
-          // else just move the pointer and following function will map the rb
-          out_tmp -= p.fft_size;
-        }
-      }
       map_dmrs_ptr(p.delta, p_mod_dmrs, out_tmp);
       p_mod_dmrs += dmrs_per_rb;
       out_tmp += NR_NB_SC_PER_RB;
@@ -309,14 +236,6 @@ static void map_current_symbol(const nr_phy_pxsch_params_t p,
     if (map_data_dmrs_ptr) {
       c16_t *out_tmp = out + start_sc;
       for (unsigned int rb = 0; rb < p.nb_rb; rb++) {
-        if (rb == dc_rb) {
-          if (rb_over_dc) {
-            map_over_dc(rb_over_dc, n_cdm, p.fft_size, dmrs_per_rb, data_per_rb, p.delta, 0, NULL, &p_mod_dmrs, &data_tmp, &out_tmp, map_data_dmrs_ptr, map_dmrs_ptr);
-            continue;
-          } else {
-            out_tmp -= p.fft_size;
-          }
-        }
         map_data_dmrs_ptr(n_cdm, data_tmp, out_tmp);
         data_tmp += data_per_rb;
         out_tmp += NR_NB_SC_PER_RB;
@@ -324,58 +243,30 @@ static void map_current_symbol(const nr_phy_pxsch_params_t p,
     }
   /* If current symbol is a PTRS symbol */
   } else if (ptrs_symbol) {
-    const unsigned int first_ptrs_re = get_first_ptrs_re(p.rnti, p.K_ptrs, p.nb_rb, p.k_RE_ref) + start_sc;
-    const unsigned int ptrs_idx_re = (start_sc - first_ptrs_re) % NR_NB_SC_PER_RB; // PTRS RE index within RB
-    unsigned int non_ptrs_rb = (start_sc - first_ptrs_re) / NR_NB_SC_PER_RB; // number of RBs before the first PTRS RB
+    const unsigned int first_ptrs_re = get_first_ptrs_re(p.rnti, p.K_ptrs, p.nb_rb, p.k_RE_ref);
+    const unsigned int ptrs_idx_re = first_ptrs_re % NR_NB_SC_PER_RB; // PTRS RE index within RB
+    const unsigned int non_ptrs_rb = first_ptrs_re / NR_NB_SC_PER_RB; // number of RBs before the first PTRS RB
     int ptrs_idx_rb = -non_ptrs_rb; // RB count to check for PTRS RB
     c16_t *out_tmp = out + start_sc;
     const c16_t *p_mod_ptrs = ptrs_seq;
     /* map data to RBs before the first PTRS RB or if current RB has no PTRS */
     for (unsigned int rb = 0; rb < p.nb_rb; rb++) {
       if (rb < non_ptrs_rb || ptrs_idx_rb % p.K_ptrs) {
-        if (rb == dc_rb) {
-          if (rb_over_dc) {
-            map_over_dc(rb_over_dc, n_cdm, p.fft_size, 0, 0, p.delta, 0, NULL, NULL, &data_tmp, &out_tmp, map_data_dmrs_ptr, map_dmrs_ptr);
-            continue;
-          } else {
-            out_tmp -= p.fft_size;
-          }
-        }
         map_data_rb(data_tmp, out_tmp);
         data_tmp += NR_NB_SC_PER_RB;
-        out_tmp += NR_NB_SC_PER_RB;
       } else {
-        if (rb == dc_rb) {
-          if (rb_over_dc) {
-            map_over_dc(rb_over_dc, n_cdm, p.fft_size, 0, 0, p.delta, ptrs_idx_re, &p_mod_ptrs, NULL, &data_tmp, &out_tmp, map_data_dmrs_ptr, map_dmrs_ptr);
-            continue;
-          } else {
-            out_tmp -= p.fft_size;
-          }
-        }
         map_data_ptrs(ptrs_idx_re, data_tmp, p_mod_ptrs, out_tmp);
         p_mod_ptrs++; // increament once as only one PTRS RE per RB
         data_tmp += (NR_NB_SC_PER_RB - 1);
-        out_tmp += NR_NB_SC_PER_RB;
       }
+      out_tmp += NR_NB_SC_PER_RB;
       ptrs_idx_rb++;
     }
   } else {
     /* only data in this symbol */
-    c16_t *out_tmp = out + start_sc;
-    for (unsigned int rb = 0; rb < p.nb_rb; rb++) {
-      if (rb == dc_rb) {
-        if (rb_over_dc) {
-          map_over_dc(rb_over_dc, n_cdm, p.fft_size, 0, 0, p.delta, 0, NULL, NULL, &data_tmp, &out_tmp, map_data_dmrs_ptr, map_dmrs_ptr);
-          continue;
-        } else {
-          out_tmp -= p.fft_size;
-        }
-      }
-      map_data_rb(data_tmp, out_tmp);
-      data_tmp += NR_NB_SC_PER_RB;
-      out_tmp += NR_NB_SC_PER_RB;
-    }
+    const unsigned int nb_re = p.nb_rb * NR_NB_SC_PER_RB;
+    memcpy(out + start_sc, data_tmp, nb_re * sizeof(c16_t));
+    data_tmp += nb_re;
   }
   *data = data_tmp;
 }
@@ -429,8 +320,8 @@ static void map_symbols(const nr_phy_pxsch_params_t p,
   const c16_t *cur_data = data;
   uint8_t dmrs_symb_idx = 0;
   for (int l = p.start_symbol; l < p.start_symbol + p.num_symbols; l++) {
-    const bool dmrs_symbol = is_dmrs_symbol(l, p.dmrs_symb_pos);
-    const bool ptrs_symbol = is_ptrs_symbol(l, p.ptrs_symb_pos);
+    const bool dmrs_symbol = IS_BIT_SET(p.dmrs_symb_pos, l);
+    const bool ptrs_symbol = IS_BIT_SET(p.ptrs_symb_pos, l);
     c16_t mod_dmrs_amp[ALNARS_16_4(n_dmrs)] __attribute((aligned(16)));
     c16_t mod_ptrs_amp[ALNARS_16_4(p.nb_rb)] __attribute((aligned(16)));
     const uint32_t *gold = NULL;
@@ -727,7 +618,7 @@ static void get_first_uci_symbol(const uint8_t start_symbol,
   // First non-DMRS symbol
   const uint16_t last_sym = start_symbol + num_symbols;
   for (uint_fast8_t s = start_symbol; s < last_sym; s++) {
-    if (!is_dmrs_symbol(s, dmrs_map)) {
+    if (!IS_BIT_SET(dmrs_map, s)) {
       *first_non_dmrs_sym = s;
       break;
     }
@@ -736,7 +627,7 @@ static void get_first_uci_symbol(const uint8_t start_symbol,
   // Symbol after first consequtive DMRS symbol
   const int first_dmrs_sym = get_next_dmrs_symbol_in_slot(dmrs_map, start_symbol, last_sym);
   *after_dmrs_symb = first_dmrs_sym + 1;
-  while (is_dmrs_symbol(*after_dmrs_symb, dmrs_map) && *after_dmrs_symb < last_sym) {
+  while (IS_BIT_SET(dmrs_map, *after_dmrs_symb) && *after_dmrs_symb < last_sym) {
     (*after_dmrs_symb)++;
   }
 
@@ -826,12 +717,14 @@ static void map_uci_common(struct map_uci_common_arg p)
         }
         total_placed++;
       }
-      if (p.uci_type_to_map == BIT_TYPE_CSI1 && p.resv_ack_pos_symb) {
+      if (p.uci_type_to_map != BIT_TYPE_ACK_RESERVED)
+        p.m_uci_current[sym]--;
+      if (p.uci_type_to_map == BIT_TYPE_CSI1 || p.uci_type_to_map == BIT_TYPE_CSI2) {
         uint32_t prev_re_offset = re_offset;
         re_offset += d_factor_re;
-        for (uint32_t i = 0; i < p.resv_ack_count_symb[sym] / p.nlqm; i++) {
-          uint32_t resv_re = (p.resv_ack_pos_symb[sym][i * p.nlqm] - symbol_start_bit_idx[sym]) / p.nlqm;
-          if (resv_re > prev_re_offset && resv_re <= re_offset)
+        for (uint32_t re = prev_re_offset + 1; re <= re_offset && re < uci_re_on_sym; re++) {
+          uci_on_pusch_bit_type_t t = p.template[symbol_start_bit_idx[sym] + (re * p.nlqm)];
+          if (skip_mapping_current_uci(t, p.uci_type_to_map))
             re_offset++;
         }
       } else {
@@ -866,6 +759,7 @@ static void map_overlapped_ack(uci_on_pusch_bit_type_t *template,
 {
   const int placeholder_start = (pusch_pdu->pusch_uci.harq_ack_bit_length == 1) ? 1 : 2;
   const int Qm = pusch_pdu->qam_mod_order;
+  const int nlqm = Qm * pusch_pdu->nrOfLayers;
   uint32_t ack_bits_marked = 0;
   for (uint8_t sym_iter = l1_c; sym_iter < pusch_pdu->nr_of_symbols; sym_iter++) {
     const uint32_t num_reserved_bits_on_sym = count_by_sym[sym_iter];
@@ -882,15 +776,23 @@ static void map_overlapped_ack(uci_on_pusch_bit_type_t *template,
     const int32_t num_ack_remaining = G_ack - ack_bits_marked;
     if (num_ack_remaining <= 0)
       continue;
-    const uint32_t d_factor_re = get_d_factor_re(num_ack_remaining, num_reserved_bits_on_sym);
-    for (uint32_t i = 0; i < num_reserved_bits_on_sym && ack_bits_marked < G_ack; i += d_factor_re) {
-      uint32_t pos = reserved_indices_on_this_sym[i];
-      int bit_in_group = pos % Qm;
-      if (template[pos] == BIT_TYPE_ULSCH) // puncturing ULSCH
-        template[pos] = (bit_in_group >= placeholder_start) ? BIT_TYPE_ACK_PLACEHOLDER : BIT_TYPE_ACK_RESERVED;
-      else  // puncturing CSIp2
-        template[pos] = (bit_in_group >= placeholder_start) ? BIT_TYPE_ACK_PLACEHOLDER_CSI2 : BIT_TYPE_ACK_RESERVED_CSI2;
-      ack_bits_marked++;
+    AssertFatal(num_reserved_bits_on_sym % nlqm == 0,
+                "reserved bits on symbol (%u) not a multiple of nlqm (%d)\n",
+                num_reserved_bits_on_sym,
+                nlqm);
+    const uint32_t num_reserved_re = num_reserved_bits_on_sym / nlqm;
+    const uint32_t num_ack_re_remaining = num_ack_remaining / nlqm;
+    const uint32_t d_factor_re = get_d_factor_re(num_ack_re_remaining, num_reserved_re);
+    for (uint32_t re = 0; re < num_reserved_re && ack_bits_marked < G_ack; re += d_factor_re) {
+      for (int b = 0; b < nlqm; b++) {
+        uint32_t pos = reserved_indices_on_this_sym[re * nlqm + b];
+        int bit_in_group = pos % Qm;
+        if (template[pos] == BIT_TYPE_ULSCH) // puncturing ULSCH
+          template[pos] = (bit_in_group >= placeholder_start) ? BIT_TYPE_ACK_PLACEHOLDER : BIT_TYPE_ACK_RESERVED;
+        else // puncturing CSIp2
+          template[pos] = (bit_in_group >= placeholder_start) ? BIT_TYPE_ACK_PLACEHOLDER_CSI2 : BIT_TYPE_ACK_RESERVED_CSI2;
+        ack_bits_marked++;
+      }
     }
   }
 }
@@ -1108,7 +1010,7 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
     K_ptrs = pusch_pdu->pusch_ptrs.ptrs_freq_density;
     k_RE_ref = pusch_pdu->pusch_ptrs.ptrs_ports_list[0].ptrs_re_offset;
     uint8_t L_ptrs = 1 << pusch_pdu->pusch_ptrs.ptrs_time_density;
-    set_ptrs_symb_idx(&ulsch_ue->ptrs_symbols, number_of_symbols, start_symbol, L_ptrs, ul_dmrs_symb_pos);
+    ulsch_ue->ptrs_symbols = get_ptrs_symb_idx(number_of_symbols, start_symbol, L_ptrs, ul_dmrs_symb_pos);
     ulsch_ue->n_ptrs = (nb_rb + K_ptrs - 1) / K_ptrs;
     int ptrsSymbPerSlot = get_ptrs_symbols_in_slot(ulsch_ue->ptrs_symbols, start_symbol, number_of_symbols);
     unav_res = ulsch_ue->n_ptrs * ptrsSymbPerSlot;
@@ -1136,10 +1038,22 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
                     .oob_event_value = 0};
   trace_pdu(&tmp);
 
+#if T_TRACER
+    {
+      // capture Tx Payload via T-Tracer
+      log_ul_payload_tx_bits(frame, slot, &UE->frame_parms, pusch_pdu,
+                             get_num_dmrs(pusch_pdu->ul_dmrs_symb_pos),
+                             get_dmrs_port(0, pusch_pdu->dmrs_ports),
+                             (const uint8_t *)harq_process_ul_ue->payload_AB,
+                             pusch_pdu->pusch_data.tb_size);
+    }
+#endif
+
   /////////////////////////ULSCH coding/////////////////////////
 
   rate_match_info_uci_t rm_info = {0};
-  if(nr_ulsch_pre_encoding(UE, ulsch_ue, frame, slot, G, 1, ULSCH_ids) != 0) {
+  if (nr_ulsch_pre_encoding(harq_process_ul_ue, pusch_pdu->pusch_data.tb_size, pusch_pdu->nrOfLayers, pusch_pdu->ldpcBaseGraph)
+      != 0) {
     LOG_E(PHY, "Error pre-encoding\n");
     return;
   }
@@ -1224,11 +1138,7 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
   }
 
   uint16_t start_rb = pusch_pdu->rb_start;
-  uint16_t start_sc = frame_parms->first_carrier_offset + (start_rb + pusch_pdu->bwp_start) * NR_NB_SC_PER_RB;
-
-  if (start_sc >= frame_parms->ofdm_symbol_size)
-    start_sc -= frame_parms->ofdm_symbol_size;
-
+  const int start_sc = (start_rb + pusch_pdu->bwp_start) * NR_NB_SC_PER_RB;
   ulsch_ue->Nid_cell = frame_parms->Nid_cell;
 
   LOG_D(PHY,
@@ -1393,7 +1303,6 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
     nr_phy_pxsch_params_t params = {.rnti = rnti,
                                     .K_ptrs = K_ptrs,
                                     .k_RE_ref = k_RE_ref,
-                                    .first_sc_offset = frame_parms->first_carrier_offset,
                                     .fft_size = frame_parms->ofdm_symbol_size,
                                     .num_rb_max = frame_parms->N_RB_UL,
                                     .symbols_per_slot = frame_parms->symbols_per_slot,
@@ -1430,39 +1339,19 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
   // The Precoding matrix:
   for (int ap = 0; ap < frame_parms->nb_antennas_tx; ap++) {
     for (int l = start_symbol; l < start_symbol + number_of_symbols; l++) {
-      uint16_t k = start_sc;
+      int k = start_sc;
 
       for (int rb = 0; rb < nb_rb; rb++) {
         // get pmi info
         uint8_t pmi = pusch_pdu->Tpmi;
 
         if (pmi == 0) { // unitary Precoding
-          if (k + NR_NB_SC_PER_RB <= frame_parms->ofdm_symbol_size) { // RB does not cross DC
-            if (ap < pusch_pdu->nrOfLayers)
-              memcpy(&txdataF[ap][l * frame_parms->ofdm_symbol_size + k],
-                     &tx_precoding[ap][l * frame_parms->ofdm_symbol_size + k],
-                     NR_NB_SC_PER_RB * sizeof(c16_t));
-            else
-              memset(&txdataF[ap][l * frame_parms->ofdm_symbol_size + k], 0, NR_NB_SC_PER_RB * sizeof(int32_t));
-          } else { // RB does cross DC
-            int neg_length = frame_parms->ofdm_symbol_size - k;
-            int pos_length = NR_NB_SC_PER_RB - neg_length;
-            if (ap < pusch_pdu->nrOfLayers) {
-              memcpy(&txdataF[ap][l * frame_parms->ofdm_symbol_size + k],
-                     &tx_precoding[ap][l * frame_parms->ofdm_symbol_size + k],
-                     neg_length * sizeof(c16_t));
-              memcpy(&txdataF[ap][l * frame_parms->ofdm_symbol_size],
-                     &tx_precoding[ap][l * frame_parms->ofdm_symbol_size],
-                     pos_length * sizeof(int32_t));
-            } else {
-              memset(&txdataF[ap][l * frame_parms->ofdm_symbol_size + k], 0, neg_length * sizeof(int32_t));
-              memset(&txdataF[ap][l * frame_parms->ofdm_symbol_size], 0, pos_length * sizeof(int32_t));
-            }
-          }
+          const int re_offset = l * frame_parms->ofdm_symbol_size + k;
+          if (ap < pusch_pdu->nrOfLayers)
+            memcpy(&txdataF[ap][re_offset], &tx_precoding[ap][re_offset], NR_NB_SC_PER_RB * sizeof(c16_t));
+          else
+            memset(&txdataF[ap][re_offset], 0, NR_NB_SC_PER_RB * sizeof(c16_t));
           k += NR_NB_SC_PER_RB;
-          if (k >= frame_parms->ofdm_symbol_size) {
-            k -= frame_parms->ofdm_symbol_size;
-          }
         } else {
           // get the precoding matrix weights:
           const char *W_prec;
@@ -1495,9 +1384,7 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
           for (int i = 0; i < NR_NB_SC_PER_RB; i++) {
             int32_t re_offset = l * frame_parms->ofdm_symbol_size + k;
             txdataF[ap][re_offset] = nr_layer_precoder(slot_sz, tx_precoding, W_prec, pusch_pdu->nrOfLayers, re_offset);
-            if (++k >= frame_parms->ofdm_symbol_size) {
-              k -= frame_parms->ofdm_symbol_size;
-            }
+            k++;
           }
         }
       } // RB loop
@@ -1516,22 +1403,19 @@ void nr_tx_rotation_and_ofdm_mod(const uint8_t slot,
                                  bool was_symbol_used[NR_SYMBOLS_PER_SLOT],
                                  bool no_phase_pre_comp)
 {
-  int N_RB = (linktype == link_type_sl) ? frame_parms->N_RB_SL : frame_parms->N_RB_UL;
+  const int N_RB = (linktype == link_type_sl) ? frame_parms->N_RB_SL : frame_parms->N_RB_UL;
 
-  if (!no_phase_pre_comp) {
-    for (int i = 0; i < frame_parms->symbols_per_slot; i++) {
-      if (was_symbol_used[i] == false)
-        continue;
-      for (int ap = 0; ap < n_antenna_ports; ap++) {
-        apply_nr_rotation_TX(frame_parms,
-                             txdataF[ap],
-                             false,
-                             frame_parms->symbol_rotation[linktype],
-                             slot,
-                             N_RB,
-                             i,
-                             1);
-      }
+  for (int i = 0; i < frame_parms->symbols_per_slot; i++) {
+    if (was_symbol_used[i] == false)
+      continue;
+    for (int ap = 0; ap < n_antenna_ports; ap++) {
+      // Phase compensation
+      if (!no_phase_pre_comp)
+        apply_nr_rotation_TX(frame_parms, txdataF[ap], frame_parms->symbol_rotation[linktype], slot, N_RB, i, 1);
+      // Inverse FFT shift: L1 fills txdataF FFT shifted, the IDFT needs the native FFT layout
+      fftshift_inverse_inplace(txdataF[ap] + i * frame_parms->ofdm_symbol_size,
+                               N_RB * NR_NB_SC_PER_RB,
+                               frame_parms->ofdm_symbol_size);
     }
   }
 

@@ -1,9 +1,7 @@
 <!-- SPDX-License-Identifier: LicenseRef-CSSL-1.0 -->
 
 <testCaseList>
-  <htmlTabRef>rfsim-5gnr-fdd-u0-25prb</htmlTabRef>
   <htmlTabName>VNF-PNF nFAPI FDD u0 25PRB gNB</htmlTabName>
-  <htmlTabIcon>wrench</htmlTabIcon>
 
   <testCase>
     <class>Pull_Local_Registry</class>
@@ -46,14 +44,6 @@
     <desc>Verify 2nd PDU session is up</desc>
     <id>rfsim5g_ue_pdu_2</id>
     <node>localhost</node>
-  </testCase>
-
-  <testCase>
-    <class>Custom_Command</class>
-    <desc>Configure policy routing for PDU2 source IP</desc>
-    <may_fail>true</may_fail>
-    <node>localhost</node>
-    <command>docker exec rfsim5g-oai-nr-ue sh -c "ip rule add from 12.1.2.2/32 table 1002 prio 1002; ip route replace default dev oaitun_ue1p2 src 12.1.2.2 table 1002"</command>
   </testCase>
 
   <testCase>

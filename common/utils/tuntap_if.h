@@ -72,9 +72,10 @@ bool tap_config(const char* ifname);
  * in same subnet).
  * \param[in] ifname name of the interface
  * \param[in] instance_id unique instance number, used to create the table
+ * \param[in] pdu_session_id PDU session ID, used to create the table
  * \param[in] ipv4 IPv4 address of the UE
  */
-void setup_ue_ipv4_route(const char* ifname, int instance_id, const char *ipv4);
+void setup_ue_ipv4_route(const char* ifname, int instance_id, int pdu_session_id, const char *ipv4);
 
 /*!
  * \brief This function allocates a TUN or TAP interface
@@ -83,6 +84,12 @@ void setup_ue_ipv4_route(const char* ifname, int instance_id, const char *ipv4);
  * \return file descriptor of the allocated interface
  */
 int tuntap_alloc(int flag, const char *dev);
+
+/*!
+ * \brief Clear O_NONBLOCK on a TUN/TAP fd (for blocking read threads)
+ * \param[in] fd TUN/TAP file descriptor
+ */
+void tuntap_reblock(int fd);
 
 /*!
  * \brief This function destroys the TUN or TAP interface
